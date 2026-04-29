@@ -1,4 +1,4 @@
-import { mkdir, rm, cp, writeFile, chmod } from "node:fs/promises";
+import { mkdir, rm, cp, writeFile, chmod, access } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
@@ -43,6 +43,8 @@ function buildInfoPlist() {
   <string>${appName}</string>
   <key>CFBundleExecutable</key>
   <string>${appName}</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundleIdentifier</key>
   <string>com.crabswitcher.app</string>
   <key>CFBundleName</key>
@@ -75,6 +77,15 @@ await mkdir(macOSDir, { recursive: true });
 await mkdir(resourcesDir, { recursive: true });
 await cp(swiftBinary, appBinary);
 await chmod(appBinary, 0o755);
+
+const iconPath = join(root, "assets", "icon.icns");
+try {
+  await access(iconPath);
+  await cp(iconPath, join(resourcesDir, "AppIcon.icns"));
+} catch (e) {
+  console.warn("Warning: assets/icon.icns not found, building without icon.");
+}
+
 await writeFile(join(appContents, "Info.plist"), buildInfoPlist(), "utf8");
 
 console.log("Applying ad-hoc code signature...");

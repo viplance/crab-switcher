@@ -1,0 +1,11 @@
+{
+  "name": "crab-switcher",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Simple macOS toolbar app that switches EN/RU by Fn key.",
+  "scripts": {
+    "build": "node ./scripts/build.mjs",
+    "dmg": "node ./scripts/dmg.mjs",
+    "start": "node ./scripts/start.mjs"
+  }
+}

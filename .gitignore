@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+
+# Swift / Xcode
+.build/
+Packages/
+Package.resolved
+*.xcodeproj
+*.xcworkspace
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Build output
+dist/
+build/
+bin/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo

@@ -1,5 +1,6 @@
 import AppKit
 import Carbon
+import ServiceManagement
 
 // MARK: - App delegate
 
@@ -11,6 +12,11 @@ final class CrabSwitcherApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let openPermissionsItem = NSMenuItem(
         title: "Open Input Monitoring Settings…",
         action: #selector(openPrivacySettings),
+        keyEquivalent: ""
+    )
+    private let launchAtLoginItem = NSMenuItem(
+        title: "Launch at Login",
+        action: #selector(toggleLaunchAtLogin),
         keyEquivalent: ""
     )
     private var eventTap: CFMachPort?
@@ -27,6 +33,7 @@ final class CrabSwitcherApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         attemptInstallAndUpdateUI()
         installNSEventFallback()
         installWorkspaceObserver()
+        setupInitialLaunchAtLogin()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -71,6 +78,9 @@ final class CrabSwitcherApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         openPermissionsItem.target = self
         menu.addItem(openPermissionsItem)
         menu.addItem(NSMenuItem.separator())
+        launchAtLoginItem.target = self
+        menu.addItem(launchAtLoginItem)
+        menu.addItem(NSMenuItem.separator())
         let quitItem = NSMenuItem(
             withTitle: "Quit CrabSwitcher",
             action: #selector(quitApp),
@@ -84,6 +94,7 @@ final class CrabSwitcherApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         attemptInstallAndUpdateUI()
         updateLanguageTitle()
+        updateLaunchAtLoginState()
     }
 
     func menuDidClose(_ menu: NSMenu) {
@@ -251,6 +262,37 @@ final class CrabSwitcherApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func quitApp() {
         NSApplication.shared.terminate(nil)
+    }
+
+    // MARK: - Launch at Login
+
+    @objc private func toggleLaunchAtLogin() {
+        let service = SMAppService.mainApp
+        do {
+            if service.status == .enabled {
+                try service.unregister()
+            } else {
+                try service.register()
+            }
+        } catch {
+            print("Failed to toggle Launch at Login: \(error)")
+        }
+        updateLaunchAtLoginState()
+    }
+
+    private func updateLaunchAtLoginState() {
+        launchAtLoginItem.state = (SMAppService.mainApp.status == .enabled) ? .on : .off
+    }
+
+    private func setupInitialLaunchAtLogin() {
+        let key = "hasSetInitialLaunchAtLogin"
+        if !UserDefaults.standard.bool(forKey: key) {
+            let service = SMAppService.mainApp
+            if service.status != .enabled {
+                try? service.register()
+            }
+            UserDefaults.standard.set(true, forKey: key)
+        }
     }
 }
 

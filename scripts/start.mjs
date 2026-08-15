@@ -56,10 +56,7 @@ async function main() {
 
   console.log("\n2) Stopping any running instance…");
   try {
-    await execFileAsync("pkill", [
-      "-f",
-      "CrabSwitcher.app/Contents/MacOS/CrabSwitcher"
-    ]);
+    await execFileAsync("pkill", ["-f", "CrabSwitcher"]);
   } catch {
     // pkill returns 1 if no process matched; ignore
   }

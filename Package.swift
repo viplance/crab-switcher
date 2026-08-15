@@ -16,6 +16,10 @@ let package = Package(
                 .linkedFramework("AppKit"),
                 .linkedFramework("Carbon")
             ]
+        ),
+        .testTarget(
+            name: "CrabSwitcherTests",
+            dependencies: ["CrabSwitcher"]
         )
     ]
 )

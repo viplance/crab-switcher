@@ -5,9 +5,41 @@ import ServiceManagement
 // MARK: - App delegate
 
 final class CrabSwitcherApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private enum FnEventSource: Hashable {
+        case eventTap
+        case nsEvent
+    }
+
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private let switcher = KeyboardLayoutSwitcher()
     private let menu = NSMenu()
+    private let languagesMenu = NSMenu(title: "Languages")
+    private lazy var languagesItem: NSMenuItem = {
+        let item = NSMenuItem(title: "Languages", action: nil, keyEquivalent: "")
+        item.submenu = languagesMenu
+        return item
+    }()
+    private let hotkeyLabel = NSTextField(labelWithString: "")
+    private lazy var hotkeyRowView: HotkeyMenuRowView = {
+        let rowHeight: CGFloat = 22
+        let row = HotkeyMenuRowView(frame: NSRect(x: 0, y: 0, width: 220, height: rowHeight))
+        hotkeyLabel.font = .menuFont(ofSize: 0)
+        hotkeyLabel.translatesAutoresizingMaskIntoConstraints = false
+        row.addSubview(hotkeyLabel)
+        NSLayoutConstraint.activate([
+            hotkeyLabel.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 23),
+            hotkeyLabel.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -8),
+            hotkeyLabel.centerYAnchor.constraint(equalTo: row.centerYAnchor, constant: -2),
+        ])
+        row.label = hotkeyLabel
+        row.onClick = { [weak self] in self?.recordHotkey() }
+        return row
+    }()
+    private lazy var hotkeyItem: NSMenuItem = {
+        let item = NSMenuItem()
+        item.view = hotkeyRowView
+        return item
+    }()
     private let permissionStatusItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let openPermissionsItem = NSMenuItem(
         title: "Open Input Monitoring Settings…",
@@ -22,13 +54,14 @@ final class CrabSwitcherApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var eventTap: CFMachPort?
     private var eventTapSource: CFRunLoopSource?
     private var nsEventMonitor: Any?
-    private var fnPressed = false
+    private var activeFnSources: Set<FnEventSource> = []
+    private var lastShortcutTimestamp: TimeInterval?
     private var workspaceObserver: Any?
     private var permissionRetryTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         configureMenu()
-        refreshStatusIcon()
+        configureStatusItem()
         CGRequestListenEventAccess()
         attemptInstallAndUpdateUI()
         installNSEventFallback()
@@ -37,11 +70,8 @@ final class CrabSwitcherApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        uninstallFnMonitor()
-        if let monitor = nsEventMonitor {
-            NSEvent.removeMonitor(monitor)
-            nsEventMonitor = nil
-        }
+        uninstallEventTap()
+        uninstallNSEventFallback()
         permissionRetryTimer?.invalidate()
         if let obs = workspaceObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(obs)
@@ -53,25 +83,111 @@ final class CrabSwitcherApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// still catch the Fn key here.
     private func installNSEventFallback() {
         if nsEventMonitor != nil { return }
-        nsEventMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
-            guard let self else { return }
-            let isNowDown = event.modifierFlags.contains(.function)
-            if isNowDown && !self.fnPressed {
-                DispatchQueue.main.async { self.toggleLanguage() }
+        nsEventMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.flagsChanged, .keyDown, .systemDefined]
+        ) { [weak self] event in
+            DispatchQueue.main.async { [weak self] in
+                self?.handleNSEvent(event)
             }
-            self.fnPressed = isNowDown
         }
+    }
+
+    private func uninstallNSEventFallback() {
+        guard let monitor = nsEventMonitor else { return }
+        NSEvent.removeMonitor(monitor)
+        nsEventMonitor = nil
+    }
+
+    /// The event tap and NSEvent monitor report the same physical Fn press with
+    /// matching timestamps. Track both sources and coalesce those duplicate
+    /// reports without delaying a later physical press.
+    private func handleFnStateChange(
+        isNowDown: Bool,
+        source: FnEventSource,
+        timestamp: TimeInterval
+    ) {
+        dispatchPrecondition(condition: .onQueue(.main))
+
+        guard isNowDown else {
+            // A release reported by either API proves that the physical key is
+            // up. Clearing both avoids a stale source blocking the next press.
+            activeFnSources.removeAll()
+            return
+        }
+        guard activeFnSources.insert(source).inserted else { return }
+        guard activeFnSources.count == 1 else { return }
+
+        if let lastTimestamp = lastShortcutTimestamp,
+           abs(timestamp - lastTimestamp) < 0.08 {
+            return
+        }
+        lastShortcutTimestamp = timestamp
+        toggleLanguage()
+    }
+
+    private static func isEjectKeyDown(_ event: NSEvent) -> Bool {
+        guard event.type == .systemDefined, event.subtype.rawValue == 8 else { return false }
+        let data1 = event.data1
+        let keyCode = (data1 & 0xFFFF0000) >> 16
+        let keyFlags = data1 & 0x0000FFFF
+        let isKeyDown = ((keyFlags & 0xFF00) >> 8) == 0x0A
+        return keyCode == 14 && isKeyDown
+    }
+
+    private func handleNSEvent(_ event: NSEvent) {
+        if isRecordingHotkey { return }
+
+        if event.type == .keyDown, !event.isARepeat {
+            let flags = event.cgEvent?.flags
+                ?? CGEventFlags(rawValue: UInt64(event.modifierFlags.rawValue))
+            if selectedHotkey.matches(keyCode: event.keyCode, flags: flags) {
+                triggerShortcut(timestamp: event.timestamp)
+            }
+            return
+        }
+
+        if event.type == .systemDefined,
+           selectedHotkey.isEject,
+           Self.isEjectKeyDown(event) {
+            triggerShortcut(timestamp: event.timestamp)
+            return
+        }
+
+        if event.type == .flagsChanged, selectedHotkey.isFnOnly {
+            handleFnStateChange(
+                isNowDown: event.modifierFlags.contains(.function),
+                source: .nsEvent,
+                timestamp: event.timestamp
+            )
+        }
+    }
+
+    private func triggerShortcut(timestamp: TimeInterval) {
+        if let lastTimestamp = lastShortcutTimestamp,
+           abs(timestamp - lastTimestamp) < 0.08 {
+            return
+        }
+        lastShortcutTimestamp = timestamp
+        toggleLanguage()
     }
 
     // MARK: - Menu
 
     private func configureMenu() {
         let switchItem = NSMenuItem(
-            withTitle: "Switch Language Now",
+            title: "Switch Language Now",
             action: #selector(toggleLanguageNow),
             keyEquivalent: ""
         )
+        switchItem.target = self
         menu.addItem(switchItem)
+        menu.addItem(languagesItem)
+        rebuildLanguagesMenu()
+        let hotkeySpacer = NSMenuItem()
+        hotkeySpacer.view = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 6))
+        menu.addItem(hotkeySpacer)
+        menu.addItem(hotkeyItem)
+        updateHotkeyTitle()
         menu.addItem(NSMenuItem.separator())
         permissionStatusItem.isEnabled = false
         menu.addItem(permissionStatusItem)
@@ -82,10 +198,11 @@ final class CrabSwitcherApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(launchAtLoginItem)
         menu.addItem(NSMenuItem.separator())
         let quitItem = NSMenuItem(
-            withTitle: "Quit CrabSwitcher",
+            title: "Quit CrabSwitcher",
             action: #selector(quitApp),
             keyEquivalent: "q"
         )
+        quitItem.target = self
         menu.addItem(quitItem)
         menu.delegate = self
         statusItem.menu = menu
@@ -93,22 +210,141 @@ final class CrabSwitcherApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuWillOpen(_ menu: NSMenu) {
         attemptInstallAndUpdateUI()
+        rebuildLanguagesMenu()
+        updateHotkeyTitle()
         updateLanguageTitle()
         updateLaunchAtLoginState()
     }
 
+    private var selectedHotkey: CustomHotkey {
+        get { CustomHotkey.load() }
+        set {
+            newValue.save()
+            activeFnSources.removeAll()
+            lastShortcutTimestamp = nil
+            updateHotkeyTitle()
+        }
+    }
+
+    private var isRecordingHotkey = false
+
+    private func updateHotkeyTitle() {
+        hotkeyLabel.stringValue = isRecordingHotkey
+            ? "Hotkey: Press any key…"
+            : "Hotkey: \(selectedHotkey.title)"
+    }
+
+    private func recordHotkey() {
+        isRecordingHotkey = true
+        updateHotkeyTitle()
+        statusItem.button?.toolTip = "Press any key…"
+    }
+
+
+    private func finishRecording(_ hotkey: CustomHotkey?) {
+        isRecordingHotkey = false
+        updateLanguageTitle()
+
+        if let hotkey {
+            if hotkey.isFnOnly && !isDefaultFnBehaviorDisabled {
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = "Disable the default macOS Fn action"
+                alert.informativeText = "To use Fn with CrabSwitcher, set ‘Press 🌐 key to’ to ‘Do Nothing’ in System Settings → Keyboard."
+                alert.addButton(withTitle: "Open Keyboard Settings")
+                alert.addButton(withTitle: "Use Fn Anyway")
+                alert.addButton(withTitle: "Cancel")
+
+                switch alert.runModal() {
+                case .alertFirstButtonReturn:
+                    selectedHotkey = hotkey
+                    openKeyboardSettings()
+                case .alertSecondButtonReturn:
+                    selectedHotkey = hotkey
+                default:
+                    break
+                }
+            } else {
+                selectedHotkey = hotkey
+            }
+        }
+
+        updateHotkeyTitle()
+    }
+
+    private var isDefaultFnBehaviorDisabled: Bool {
+        let appID = "com.apple.HIToolbox" as CFString
+        CFPreferencesAppSynchronize(appID)
+        guard let value = CFPreferencesCopyAppValue("AppleFnUsageType" as CFString, appID) as? NSNumber else {
+            return false
+        }
+        return value.intValue == 0
+    }
+
+    private func openKeyboardSettings() {
+        let pane = "x-apple.systempreferences:com.apple.Keyboard-Settings.extension"
+        if let url = URL(string: pane) {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    private func rebuildLanguagesMenu() {
+        languagesMenu.removeAllItems()
+
+        let languages = switcher.availableLanguages()
+        guard !languages.isEmpty else {
+            let item = NSMenuItem(title: "No Languages Available", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            languagesMenu.addItem(item)
+            return
+        }
+
+        let selectedIDs = switcher.selectedLanguageIDs
+        let languageFont = NSFont.menuFont(ofSize: 0)
+        let rowHeight: CGFloat = 30
+        let rowWidth = max(
+            180,
+            languages.map {
+                ceil(($0.name as NSString).size(withAttributes: [.font: languageFont]).width + 60)
+            }.max() ?? 180
+        )
+
+        for language in languages {
+            let item = NSMenuItem()
+            let checkbox = NSButton(
+                checkboxWithTitle: language.name,
+                target: self,
+                action: #selector(toggleLanguageSelection(_:))
+            )
+            checkbox.identifier = NSUserInterfaceItemIdentifier(language.id)
+            checkbox.state = selectedIDs.contains(language.id) ? .on : .off
+            checkbox.controlSize = .regular
+            checkbox.font = languageFont
+            checkbox.frame = NSRect(x: 12, y: 0, width: rowWidth - 12, height: rowHeight)
+            checkbox.autoresizingMask = [.width, .height]
+
+            let row = LanguageMenuRowView(
+                checkbox: checkbox,
+                frame: NSRect(x: 0, y: 0, width: rowWidth, height: rowHeight)
+            )
+            row.addSubview(checkbox)
+            item.view = row
+            languagesMenu.addItem(item)
+        }
+    }
+
     func menuDidClose(_ menu: NSMenu) {
-        refreshStatusIcon()
+        if !isRecordingHotkey {
+            updateLanguageTitle()
+        }
     }
 
     // MARK: - Icon
 
-    private func refreshStatusIcon() {
-        let icon = CrabStatusIcon.make()
-        statusItem.button?.image = icon
-        statusItem.button?.alternateImage = icon
+    private func configureStatusItem() {
+        statusItem.button?.image = CrabStatusIcon.make()
         statusItem.button?.imagePosition = .imageOnly
-        statusItem.button?.toolTip = "CrabSwitcher (\(switcher.currentShortTitle()))"
+        updateLanguageTitle()
     }
 
     private func updateLanguageTitle() {
@@ -132,14 +368,14 @@ final class CrabSwitcherApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// changes invalidate TCC's cached grant even though the toggle still appears
     /// enabled in System Settings).
     private func attemptInstallAndUpdateUI() {
-        let installed = installFnMonitorIfNeeded()
+        let installed = installEventTapIfNeeded()
 
         if installed {
-            permissionStatusItem.title = "🟢 Fn key monitoring active"
+            permissionStatusItem.title = "Hotkey monitoring active"
             openPermissionsItem.isHidden = true
             stopPermissionRetry()
         } else {
-            permissionStatusItem.title = "🔴 Input Monitoring permission needed"
+            permissionStatusItem.title = "Input Monitoring permission needed"
             openPermissionsItem.isHidden = false
             startPermissionRetry()
         }
@@ -157,10 +393,10 @@ final class CrabSwitcherApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         permissionRetryTimer = nil
     }
 
-    // MARK: - Event tap (Fn key)
+    // MARK: - Event tap (global hotkey)
 
     @discardableResult
-    private func installFnMonitorIfNeeded() -> Bool {
+    private func installEventTapIfNeeded() -> Bool {
         if eventTap != nil { return true }
 
         if let (tap, source) = createTap(at: .cghidEventTap) {
@@ -178,6 +414,8 @@ final class CrabSwitcherApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func createTap(at location: CGEventTapLocation) -> (CFMachPort, CFRunLoopSource)? {
         let mask = CGEventMask(1 << CGEventType.flagsChanged.rawValue)
+            | CGEventMask(1 << CGEventType.keyDown.rawValue)
+            | CGEventMask(1 << 14)
         let selfPtr = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
 
         guard let tap = CGEvent.tapCreate(
@@ -212,7 +450,7 @@ final class CrabSwitcherApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return (tap, source)
     }
 
-    private func uninstallFnMonitor() {
+    private func uninstallEventTap() {
         if let source = eventTapSource {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
             eventTapSource = nil
@@ -221,7 +459,7 @@ final class CrabSwitcherApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             CFMachPortInvalidate(tap)
             eventTap = nil
         }
-        fnPressed = false
+        activeFnSources.removeAll()
     }
 
     private func handleEventTap(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
@@ -230,28 +468,75 @@ final class CrabSwitcherApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return Unmanaged.passUnretained(event)
         }
 
-        guard type == .flagsChanged else {
+        if isRecordingHotkey {
+            if type == .keyDown {
+                let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+                if keyCode == 53 {
+                    DispatchQueue.main.async { [weak self] in self?.finishRecording(nil) }
+                    return Unmanaged.passUnretained(event)
+                }
+                let modOnly: CGEventFlags = [.maskControl, .maskAlternate, .maskShift, .maskCommand, .maskSecondaryFn]
+                let mods = event.flags.rawValue & modOnly.rawValue
+                let hotkey = CustomHotkey(keyCode: UInt16(keyCode), modifiers: mods)
+                DispatchQueue.main.async { [weak self] in self?.finishRecording(hotkey) }
+                return Unmanaged.passUnretained(event)
+            }
+            if type == .flagsChanged {
+                let fnDown = event.flags.contains(.maskSecondaryFn)
+                let hasOtherMods = event.flags.intersection([.maskControl, .maskAlternate, .maskShift, .maskCommand]) != []
+                if fnDown && !hasOtherMods {
+                    DispatchQueue.main.async { [weak self] in self?.finishRecording(.fn) }
+                    return Unmanaged.passUnretained(event)
+                }
+            }
+            if type.rawValue == 14, let nsEvent = NSEvent(cgEvent: event), Self.isEjectKeyDown(nsEvent) {
+                DispatchQueue.main.async { [weak self] in self?.finishRecording(.eject) }
+                return Unmanaged.passUnretained(event)
+            }
             return Unmanaged.passUnretained(event)
         }
 
-        let isNowDown = event.flags.contains(.maskSecondaryFn)
-        if isNowDown && !fnPressed {
-            DispatchQueue.main.async { [weak self] in
-                self?.toggleLanguage()
+        if type == .keyDown {
+            let isRepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
+            let keyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
+            if !isRepeat, selectedHotkey.matches(keyCode: keyCode, flags: event.flags) {
+                triggerShortcut(timestamp: TimeInterval(event.timestamp) / 1_000_000_000)
+            }
+            return Unmanaged.passUnretained(event)
+        }
+
+        if type == .flagsChanged, selectedHotkey.isFnOnly {
+            let isNowDown = event.flags.contains(.maskSecondaryFn)
+            handleFnStateChange(
+                isNowDown: isNowDown,
+                source: .eventTap,
+                timestamp: TimeInterval(event.timestamp) / 1_000_000_000
+            )
+        }
+
+        if type.rawValue == 14, selectedHotkey.isEject {
+            if let nsEvent = NSEvent(cgEvent: event), Self.isEjectKeyDown(nsEvent) {
+                triggerShortcut(timestamp: TimeInterval(event.timestamp) / 1_000_000_000)
             }
         }
-        fnPressed = isNowDown
+
         return Unmanaged.passUnretained(event)
     }
 
     // MARK: - Language switching
 
     private func toggleLanguage() {
-        switcher.toggleBetweenEnglishAndRussian()
+        switcher.selectNextLanguage()
         updateLanguageTitle()
     }
 
     @objc private func toggleLanguageNow() { toggleLanguage() }
+
+    @objc private func toggleLanguageSelection(_ sender: NSButton) {
+        guard let id = sender.identifier?.rawValue else { return }
+        switcher.toggleLanguageSelection(id: id)
+        sender.state = switcher.selectedLanguageIDs.contains(id) ? .on : .off
+    }
 
     @objc private func openPrivacySettings() {
         let pane = "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
@@ -268,15 +553,7 @@ final class CrabSwitcherApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func toggleLaunchAtLogin() {
         let service = SMAppService.mainApp
-        do {
-            if service.status == .enabled {
-                try service.unregister()
-            } else {
-                try service.register()
-            }
-        } catch {
-            print("Failed to toggle Launch at Login: \(error)")
-        }
+        service.status == .enabled ? try? service.unregister() : try? service.register()
         updateLaunchAtLoginState()
     }
 
@@ -296,169 +573,10 @@ final class CrabSwitcherApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 }
 
-// MARK: - NSMenuItem convenience
-
-private extension NSMenuItem {
-    convenience init(withTitle title: String, action: Selector?, keyEquivalent: String) {
-        self.init(title: title, action: action, keyEquivalent: keyEquivalent)
-        self.target = nil
-    }
-}
-
-// MARK: - Keyboard layout switcher
-
-final class KeyboardLayoutSwitcher {
-    private let preferredEnglishIDs = ["com.apple.keylayout.ABC", "com.apple.keylayout.US"]
-    private let preferredRussianIDs = ["com.apple.keylayout.Russian", "com.apple.keylayout.RussianWin"]
-
-    func toggleBetweenEnglishAndRussian() {
-        guard let current = currentInputSource() else { return }
-
-        if isRussianSource(current) {
-            if let en = findByPreferredIDs(preferredEnglishIDs) ?? selectableSources().first(where: isEnglishSource) {
-                TISSelectInputSource(en)
-            }
-        } else {
-            if let ru = findByPreferredIDs(preferredRussianIDs) ?? selectableSources().first(where: isRussianSource) {
-                TISSelectInputSource(ru)
-            }
-        }
-    }
-
-    func currentShortTitle() -> String {
-        guard let src = currentInputSource() else { return "??" }
-        return isRussianSource(src) ? "RU" : "EN"
-    }
-
-    private func currentInputSource() -> TISInputSource? {
-        TISCopyCurrentKeyboardInputSource()?.takeRetainedValue()
-    }
-
-    private func findByPreferredIDs(_ ids: [String]) -> TISInputSource? {
-        let sources = selectableSources()
-        for id in ids {
-            if let match = sources.first(where: { sourceID($0) == id }) { return match }
-        }
-        return nil
-    }
-
-    private func selectableSources() -> [TISInputSource] {
-        guard let list = TISCreateInputSourceList(nil, false)?.takeRetainedValue() as? [TISInputSource]
-        else { return [] }
-        return list.filter { boolProp($0, kTISPropertyInputSourceIsEnabled) && boolProp($0, kTISPropertyInputSourceIsSelectCapable) }
-    }
-
-    private func isRussianSource(_ src: TISInputSource) -> Bool {
-        let id = sourceID(src).lowercased()
-        if id.contains("russian") || id.contains(".ru") { return true }
-        if stringProp(src, kTISPropertyLocalizedName)?.lowercased().contains("russian") == true { return true }
-        return (stringArrayProp(src, kTISPropertyInputSourceLanguages)).contains { $0.hasPrefix("ru") }
-    }
-
-    private func isEnglishSource(_ src: TISInputSource) -> Bool {
-        let id = sourceID(src).lowercased()
-        if id.contains(".abc") || id.contains(".us") || id.contains("english") { return true }
-        let name = stringProp(src, kTISPropertyLocalizedName)?.lowercased() ?? ""
-        if name == "abc" || name.contains("english") { return true }
-        return (stringArrayProp(src, kTISPropertyInputSourceLanguages)).contains { $0.hasPrefix("en") }
-    }
-
-    private func sourceID(_ src: TISInputSource) -> String {
-        stringProp(src, kTISPropertyInputSourceID) ?? ""
-    }
-
-    private func stringProp(_ src: TISInputSource, _ key: CFString) -> String? {
-        guard let raw = TISGetInputSourceProperty(src, key) else { return nil }
-        return Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue() as String
-    }
-
-    private func stringArrayProp(_ src: TISInputSource, _ key: CFString) -> [String] {
-        guard let raw = TISGetInputSourceProperty(src, key) else { return [] }
-        return Unmanaged<CFArray>.fromOpaque(raw).takeUnretainedValue() as? [String] ?? []
-    }
-
-    private func boolProp(_ src: TISInputSource, _ key: CFString) -> Bool {
-        guard let raw = TISGetInputSourceProperty(src, key) else { return false }
-        return CFBooleanGetValue(Unmanaged<CFBoolean>.fromOpaque(raw).takeUnretainedValue())
-    }
-}
-
-// MARK: - Crab icon (resolution-independent template image)
-
-enum CrabStatusIcon {
-    static func make(size: CGFloat = 18) -> NSImage {
-        let image = NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
-            let s = rect.width / 18.0
-
-            guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
-            ctx.setFillColor(NSColor.black.cgColor)
-            ctx.setStrokeColor(NSColor.black.cgColor)
-            ctx.setLineWidth(1.1 * s)
-            ctx.setLineCap(.round)
-
-            // body
-            let bodyPath = NSBezierPath(
-                roundedRect: NSRect(x: 4.5 * s, y: 4.0 * s, width: 9.0 * s, height: 6.5 * s),
-                xRadius: 3.0 * s, yRadius: 3.0 * s
-            )
-            bodyPath.fill()
-
-            // eyestalks
-            func line(_ ax: CGFloat, _ ay: CGFloat, _ bx: CGFloat, _ by: CGFloat) {
-                ctx.move(to: CGPoint(x: ax * s, y: ay * s))
-                ctx.addLine(to: CGPoint(x: bx * s, y: by * s))
-                ctx.strokePath()
-            }
-            line(6.7, 10.5, 6.7, 11.8)
-            line(11.3, 10.5, 11.3, 11.8)
-
-            // eyes
-            func dot(_ cx: CGFloat, _ cy: CGFloat, r: CGFloat) {
-                ctx.fillEllipse(in: CGRect(x: (cx - r) * s, y: (cy - r) * s, width: 2 * r * s, height: 2 * r * s))
-            }
-            dot(6.7, 12.5, r: 0.8)
-            dot(11.3, 12.5, r: 0.8)
-
-            // legs (3 pairs)
-            let legOffsetsY: [(CGFloat, CGFloat)] = [(8.5, 9.4), (7.5, 8.1), (6.6, 6.8)]
-            for (ly, ry) in legOffsetsY {
-                line(4.8, ly, 2.2, ry)
-                line(13.2, ly, 15.8, ry)
-            }
-
-            // arms to claws
-            ctx.setLineWidth(1.3 * s)
-            line(4.5, 9.2, 2.5, 12.2)
-            line(13.5, 9.2, 15.5, 12.2)
-
-            // claws (filled triangles)
-            func claw(tip: CGPoint, a: CGPoint, b: CGPoint) {
-                ctx.move(to: CGPoint(x: tip.x * s, y: tip.y * s))
-                ctx.addLine(to: CGPoint(x: a.x * s, y: a.y * s))
-                ctx.addLine(to: CGPoint(x: b.x * s, y: b.y * s))
-                ctx.closePath()
-                ctx.fillPath()
-            }
-            claw(tip: CGPoint(x: 1.2, y: 12.5), a: CGPoint(x: 2.6, y: 14.8), b: CGPoint(x: 4.2, y: 12.8))
-            claw(tip: CGPoint(x: 16.8, y: 12.5), a: CGPoint(x: 15.4, y: 14.8), b: CGPoint(x: 13.8, y: 12.8))
-
-            return true
-        }
-        image.isTemplate = true
-        return image
-    }
-}
-
 // MARK: - Entry point
 
 let app = NSApplication.shared
 let delegate = CrabSwitcherApp()
-
-@main
-struct CrabSwitcherMain {
-    static func main() {
-        app.setActivationPolicy(.accessory)
-        app.delegate = delegate
-        app.run()
-    }
-}
+app.setActivationPolicy(.accessory)
+app.delegate = delegate
+app.run()

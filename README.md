@@ -1,6 +1,6 @@
 # CrabSwitcher
 
-Simple macOS toolbar app that toggles keyboard language between English and Russian using the `Fn` key.
+Simple macOS toolbar app that cycles through your selected keyboard languages using the `Fn` key.
 
 ## Requirements
 
@@ -58,8 +58,11 @@ directly into `dist/`, and `pnpm dmg` uses an OS temp directory for staging.
 - The menu shows `🟢 Fn key monitoring active` once permission is detected.
   The app retries automatically every 2 seconds, so you don't need to relaunch
   after granting permission.
-- If your preferred English or Russian layout has a custom name, ensure those
-  layouts are added in macOS keyboard settings.
+- Open `Languages` in the app menu and check the keyboard layouts that should
+  participate in switching. With no layouts checked, the hotkey does nothing.
+- Choose the global shortcut in `Hotkey`. When selecting `Fn`, CrabSwitcher
+  checks the macOS Globe/Fn action and links to Keyboard settings if it is not
+  set to `Do Nothing`.
 
 ## Troubleshooting: "Input Monitoring permission needed" after rebuild
 

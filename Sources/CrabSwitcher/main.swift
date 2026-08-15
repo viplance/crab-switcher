@@ -334,7 +334,9 @@ final class CrabSwitcherApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func menuDidClose(_ menu: NSMenu) {
-        if !isRecordingHotkey {
+        if isRecordingHotkey {
+            finishRecording(nil)
+        } else {
             updateLanguageTitle()
         }
     }
